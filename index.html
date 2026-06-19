@@ -716,7 +716,7 @@
         <div class="topbar">
           <div>
             <h2>Gate</h2>
-            <p>Wybierz Gate Ryanair z bazy, wpisz boarding i obsadź dwie osoby. Aplikacja pilnuje konfliktów godzinowych oraz zlicza P-Bagi i G-Bagi.</p>
+            <p>Zaplanuj Gate Ryanair i pracowników z wyprzedzeniem. O godzinie boardingu aplikacja automatycznie przeniesie ich z obecnych stanowisk na Gate na 45 minut.</p>
           </div>
         </div>
         <div class="grid two">
@@ -1015,7 +1015,7 @@
 
     function occupiedEmployeeIds() {
       const ids = assignedStationEmployeeIds();
-      state.gates.forEach(gate => [gate.employee1, gate.employee2].forEach(id => id && ids.add(id)));
+      state.gates.filter(gate => gateStatus(gate) === "live" && gate.activated).forEach(gate => [gate.employee1, gate.employee2].forEach(id => id && ids.add(id)));
       state.arrivals.forEach(arrival => arrival.employeeId && ids.add(arrival.employeeId));
       return ids;
     }
@@ -1084,7 +1084,7 @@
         if (gate.id === editedGateId) return false;
         if (gate.employee1 !== employeeId && gate.employee2 !== employeeId) return false;
         const existing = timeToMinutes(gate.boarding);
-        return existing !== null && Math.abs(existing - target) < 60;
+        return existing !== null && Math.abs(existing - target) < 45;
       });
     }
 
@@ -1099,14 +1099,14 @@
       const current = new Date();
       const currentMinutes = current.getHours() * 60 + current.getMinutes();
       if (currentMinutes < boarding) return "waiting";
-      if (currentMinutes < boarding + 60) return "live";
+      if (currentMinutes < boarding + 45) return "live";
       return "closed";
     }
 
     function gateStatusBadge(status) {
       if (status === "live") return '<span class="badge green">Na żywo</span>';
       if (status === "closed") return '<span class="badge red">Zamknięty</span>';
-      return '<span class="badge amber">Oczekuje</span>';
+      return '<span class="badge amber">Zaplanowany</span>';
     }
 
     function updateGateStatuses() {
@@ -1126,7 +1126,7 @@
           return `${station.name}, miejsce ${index + 1}`;
         }
       }
-      const gate = state.gates.find(item => item.id !== currentGateId && (item.employee1 === employeeId || item.employee2 === employeeId));
+      const gate = state.gates.find(item => item.id !== currentGateId && gateStatus(item) === "live" && item.activated && (item.employee1 === employeeId || item.employee2 === employeeId));
       if (gate) return `Gate ${gate.code} o ${gate.boarding}`;
       const arrival = state.arrivals.find(item => item.id !== currentArrivalId && item.employeeId === employeeId);
       if (arrival) return `Przylot ${arrival.code} o ${arrival.time}`;
@@ -1146,6 +1146,40 @@
       removeFromBreak(employeeId);
       station.open = true;
       station.slots[0] = { employeeId, startedAt: now() };
+    }
+
+    function moveEmployeeToGate(employeeId) {
+      if (!employeeId || !isPresent(employeeId) || attendanceIsPrm(employeeId)) return;
+      state.stations.forEach(station => {
+        station.slots = station.slots.map(slot => {
+          if (!slot || slot.employeeId !== employeeId) return slot;
+          if (station.id === "lider-zmiany") delete state.todayRoles[employeeId];
+          return null;
+        });
+      });
+      state.arrivals.forEach(arrival => {
+        if (arrival.employeeId === employeeId) arrival.employeeId = "";
+      });
+      removeFromBreak(employeeId);
+    }
+
+    function processGateTransitions() {
+      let changed = false;
+      state.gates.forEach(gate => {
+        const status = gateStatus(gate);
+        if (status === "live" && !gate.activated) {
+          gate.activated = true;
+          gate.completed = false;
+          [gate.employee1, gate.employee2].forEach(moveEmployeeToGate);
+          changed = true;
+        }
+        if (status === "closed" && gate.activated && !gate.completed) {
+          gate.completed = true;
+          [gate.employee1, gate.employee2].forEach(addToBreak);
+          changed = true;
+        }
+      });
+      return changed;
     }
 
     function removeEmployeeFromDay(employeeId) {
@@ -1190,6 +1224,7 @@
 
     function render() {
       autoRemoveFinishedWorkers();
+      processGateTransitions();
       reconcileAvailability();
       renderTopAlerts();
       renderStats();
@@ -1209,6 +1244,10 @@
 
     function tickRender() {
       if (autoRemoveFinishedWorkers()) {
+        render();
+        return;
+      }
+      if (processGateTransitions()) {
         render();
         return;
       }
@@ -1273,6 +1312,13 @@
       return `${includeEmpty ? '<option value="">Wybierz pracownika</option>' : ""}${options}`;
     }
 
+    function gatePlanningOptionItems(includeIds = []) {
+      const employees = state.employees
+        .filter(employee => isPresent(employee.id) && (!attendanceIsPrm(employee.id) || includeIds.includes(employee.id)))
+        .sort((a, b) => Number(isEndingSoon(b)) - Number(isEndingSoon(a)) || fullName(a).localeCompare(fullName(b), "pl"));
+      return `<option value="">Wybierz pracownika</option>${employees.map(employee => `<option value="${employee.id}">${escapeHtml(fullName(employee))}${employee.badgeNumber ? "" : " - brak przepustki"}${findActiveAssignment(employee.id) ? " - obecnie na stanowisku" : ""}</option>`).join("")}`;
+    }
+
     function renderEmployeeOptions() {
       const list = document.getElementById("employeesList");
       list.innerHTML = state.employees.map(employee => `<option value="${escapeHtml(fullName(employee))}"></option>`).join("");
@@ -1287,7 +1333,7 @@
         const includeIds = id === "arrivalEmployee"
           ? (editedArrival && editedArrival.employeeId ? [editedArrival.employeeId] : [])
           : (editedGate ? [editedGate.employee1, editedGate.employee2].filter(Boolean) : []);
-        select.innerHTML = employeeOptionItems(true, includeIds);
+        select.innerHTML = id === "arrivalEmployee" ? employeeOptionItems(true, includeIds) : gatePlanningOptionItems(includeIds);
         select.value = value;
       });
       const arrivalCode = document.getElementById("arrivalCode");
@@ -1474,7 +1520,7 @@
                   <label>P-Bagi <input type="number" min="0" value="${pBags}" data-pbags="${gate.id}"></label>
                   <label>G-Bagi <input type="number" min="0" value="${gBags}" data-gbags="${gate.id}"></label>
                 </div>
-              ` : '<span class="badge amber">pole bagaży po 1h</span>'}
+              ` : '<span class="badge amber">pole bagaży po 45 min</span>'}
             </td>
             <td class="row"><button class="secondary" data-close-gate="${gate.id}">Zamknij</button><button class="secondary" data-edit-gate="${gate.id}">Edytuj</button><button class="danger" data-delete-gate="${gate.id}">Usuń</button></td>
           </tr>
@@ -1820,7 +1866,6 @@
       const allowMissingPass = allowGateMissingPassOnce;
       allowGateMissingPassOnce = false;
       const id = document.getElementById("gateId").value || makeId();
-      const previousGate = state.gates.find(item => item.id === id);
       const gate = {
         id,
         code: document.getElementById("gateCode").value.trim(),
@@ -1829,7 +1874,9 @@
         employee2: document.getElementById("gateEmployee2").value,
         pBags: Number((state.gates.find(item => item.id === id) || {}).pBags || 0),
         gBags: Number((state.gates.find(item => item.id === id) || {}).gBags || 0),
-        closed: Boolean((state.gates.find(item => item.id === id) || {}).closed)
+        closed: false,
+        activated: false,
+        completed: false
       };
       if (gate.employee1 && gate.employee1 === gate.employee2) {
         return setMessage(document.getElementById("gateMessage"), "Na Gate nie można wpisać tej samej osoby dwa razy.", true);
@@ -1845,25 +1892,12 @@
       if (prmEmployee) {
         return setMessage(document.getElementById("gateMessage"), `${fullName(prmEmployee)} jest oznaczony/oznaczona jako PRM.`, true);
       }
-      const previousIds = previousGate ? [previousGate.employee1, previousGate.employee2] : [];
-      const unavailableEmployee = [gate.employee1, gate.employee2].map(findEmployee).find(employee => employee && !previousIds.includes(employee.id) && !state.breaks[employee.id]);
-      if (unavailableEmployee) {
-        return setMessage(document.getElementById("gateMessage"), `${fullName(unavailableEmployee)} nie jest obecnie dostępny/dostępna na przerwie.`, true);
-      }
-      const alreadyAssignedId = [gate.employee1, gate.employee2].find(employeeId => employeeId && findActiveAssignment(employeeId, "", -1, id));
-      if (alreadyAssignedId) {
-        const employee = findEmployee(alreadyAssignedId);
-        const activeAssignment = findActiveAssignment(alreadyAssignedId, "", -1, id);
-        return setMessage(document.getElementById("gateMessage"), `${fullName(employee)} jest już przypisany/przypisana do: ${activeAssignment}. Najpierw zdejmij tę osobę z poprzedniego stanowiska.`, true);
-      }
       const conflict = [gate.employee1, gate.employee2].map(employeeId => gateConflict(employeeId, gate.boarding, id)).find(Boolean);
       if (conflict) {
         const employeeId = [gate.employee1, gate.employee2].find(id => id && (id === conflict.employee1 || id === conflict.employee2));
         const employee = findEmployee(employeeId);
         return setMessage(document.getElementById("gateMessage"), `${employee ? fullName(employee) : "Pracownik"} nie zdąży, bo robi już Gate ${conflict.code} o ${conflict.boarding}.`, true);
       }
-      previousIds.filter(employeeId => employeeId && employeeId !== gate.employee1 && employeeId !== gate.employee2).forEach(addToBreak);
-      [gate.employee1, gate.employee2].forEach(removeFromBreak);
       const index = state.gates.findIndex(item => item.id === id);
       if (index >= 0) state.gates[index] = gate; else state.gates.push(gate);
       resetGateForm();
@@ -1924,9 +1958,8 @@
       if (closeId) {
         const gate = state.gates.find(item => item.id === closeId);
         gate.closed = true;
+        gate.completed = true;
         [gate.employee1, gate.employee2].forEach(addToBreak);
-        gate.employee1 = "";
-        gate.employee2 = "";
         render();
       }
     });
